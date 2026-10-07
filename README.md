@@ -22,7 +22,7 @@ Understanding an unfamiliar codebase can be difficult because developers need to
 ## Team Members
 
 - Shivang Kumar
-- Raghav
+- Raghav Sharma
 
 ## Setup
 
