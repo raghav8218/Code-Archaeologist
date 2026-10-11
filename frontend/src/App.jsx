@@ -1,148 +1,148 @@
-import React, { useState } from 'react'
-import GraphView from './components/GraphView.jsx'
-import CodePanel from './components/CodePanel.jsx'
+import React, { useState, useEffect } from 'react'
+import DashboardView from './components/DashboardView.jsx'
+import WorkspaceView from './components/WorkspaceView.jsx'
 
 export default function App() {
-  const [repoUrl, setRepoUrl] = useState('')
-  const [repoId, setRepoId] = useState(null)
-  const [graph, setGraph] = useState({ nodes: [], edges: [] })
-  const [meta, setMeta] = useState(null)
-  const [selected, setSelected] = useState(null)
-  const [question, setQuestion] = useState('')
-  const [answer, setAnswer] = useState('')
-  const [highlighted, setHighlighted] = useState([])
+  const [currentRoute, setCurrentRoute] = useState(
+    window.location.pathname.startsWith('/workspace') ? '/workspace' : '/'
+  )
+  const [repoData, setRepoData] = useState(null)
+  const [highlightedIds, setHighlightedIds] = useState([])
   const [loading, setLoading] = useState(false)
-  const [asking, setAsking] = useState(false)
   const [error, setError] = useState('')
 
-  async function analyze() {
-    setError('')
+  // Sync route changes with browser history
+  useEffect(() => {
+    const handlePopState = () => {
+      const path = window.location.pathname.startsWith('/workspace') ? '/workspace' : '/'
+      setCurrentRoute(path)
+    }
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
+  // Restore active repo from localStorage on initial load if on /workspace
+  useEffect(() => {
+    if (!repoData) {
+      try {
+        const storedCurrent = localStorage.getItem('code_archaeologist_active_repo')
+        if (storedCurrent) {
+          const parsed = JSON.parse(storedCurrent)
+          setRepoData(parsed)
+        } else if (currentRoute === '/workspace') {
+          // If no active repo is found, return to dashboard
+          navigateTo('/')
+        }
+      } catch {
+        // Ignore JSON error
+      }
+    }
+  }, [currentRoute, repoData])
+
+  const navigateTo = (path) => {
+    setCurrentRoute(path)
+    if (window.location.pathname !== path) {
+      window.history.pushState({}, '', path)
+    }
+  }
+
+  // Analyze repo action
+  const handleAnalyze = async (repoUrl, branch = 'main') => {
     setLoading(true)
-    setAnswer('')
-    setHighlighted([])
-    setSelected(null)
+    setError('')
+    setHighlightedIds([])
+
     try {
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repo_url: repoUrl }),
+        body: JSON.stringify({ repo_url: repoUrl, branch }),
       })
+
       const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || 'Failed to analyze repo')
-      setRepoId(data.repo_id)
-      setGraph(data.graph)
-      setMeta({ files: data.num_files, functions: data.num_functions })
-    } catch (e) {
-      setError(e.message)
+      if (!res.ok) {
+        throw new Error(data.detail || 'Analysis failed. Please verify the repo URL and branch.')
+      }
+
+      setRepoData(data)
+
+      // Store in localStorage
+      try {
+        localStorage.setItem('code_archaeologist_active_repo', JSON.stringify(data))
+
+        // Update recents list
+        const recentsRaw = localStorage.getItem('code_archaeologist_recents')
+        const recents = recentsRaw ? JSON.parse(recentsRaw) : []
+        const newEntry = {
+          repo_id: data.repo_id,
+          repo_name: data.repo_name,
+          repo_url: data.repo_url,
+          branch: data.branch,
+          num_files: data.num_files,
+          num_functions: data.num_functions,
+          timestamp: new Date().toISOString(),
+          cachedData: data,
+        }
+        const filtered = recents.filter((r) => r.repo_name !== data.repo_name)
+        const updatedRecents = [newEntry, ...filtered].slice(0, 8)
+        localStorage.setItem('code_archaeologist_recents', JSON.stringify(updatedRecents))
+      } catch (e) {
+        console.warn('LocalStorage save failed:', e)
+      }
+
+      // Route smoothly to /workspace
+      navigateTo('/workspace')
+    } catch (err) {
+      setError(err.message)
     } finally {
       setLoading(false)
     }
   }
 
-  async function ask() {
-    if (!question.trim() || !repoId) return
-    setAsking(true)
-    setAnswer('')
-    setError('')
-    try {
-      const res = await fetch(`/api/ask/${repoId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question }),
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || 'Failed to get answer')
-      setAnswer(data.answer)
-      setHighlighted(data.highlighted_ids)
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setAsking(false)
+  // Open cached repo from recents
+  const handleOpenCached = (recentItem) => {
+    if (recentItem.cachedData) {
+      setRepoData(recentItem.cachedData)
+      localStorage.setItem('code_archaeologist_active_repo', JSON.stringify(recentItem.cachedData))
+      navigateTo('/workspace')
+    } else {
+      handleAnalyze(recentItem.repo_url || recentItem.repo_name, recentItem.branch || 'main')
     }
   }
 
-  async function trace(startId) {
-    if (!repoId) return
-    const res = await fetch(`/api/trace/${repoId}?start_id=${encodeURIComponent(startId)}`)
-    const data = await res.json()
-    setHighlighted(data.nodes)
+  // Downstream BFS tracing
+  const handleTrace = async (startId) => {
+    if (!repoData?.repo_id || !startId) return
+    try {
+      const res = await fetch(
+        `/api/trace/${repoData.repo_id}?start_id=${encodeURIComponent(startId)}`
+      )
+      if (!res.ok) throw new Error('Trace failed')
+      const data = await res.json()
+      setHighlightedIds(data.nodes || [])
+    } catch (e) {
+      console.error(e)
+    }
   }
 
   return (
-    <div className="app">
-      <aside className="sidebar">
-        <div className="brand">
-          <span className="eyebrow">CODE ARCHAEOLOGIST</span>
-          <h1>Dig into any repo</h1>
-        </div>
-
-        <div className="field">
-          <label>GitHub repository URL</label>
-          <input
-            value={repoUrl}
-            onChange={(e) => setRepoUrl(e.target.value)}
-            placeholder="https://github.com/owner/small-python-repo"
-          />
-          <button onClick={analyze} disabled={loading || !repoUrl}>
-            {loading ? 'Excavating…' : 'Analyze repo'}
-          </button>
-        </div>
-
-        {error && <p className="error">{error}</p>}
-
-        {meta && (
-          <p className="muted small">
-            {meta.files} files · {meta.functions} functions parsed
-          </p>
-        )}
-
-        {repoId && (
-          <p className="muted small hotspot-legend">
-            <span className="hotspot-dot" /> Thicker red border = frequently changed (git history)
-          </p>
-        )}
-
-        {repoId && (
-          <div className="field">
-            <label>Ask about this codebase</label>
-            <textarea
-              value={question}
-              onChange={(e) => setQuestion(e.target.value)}
-              placeholder="How does authentication work?"
-              rows={3}
-            />
-            <button onClick={ask} disabled={asking || !question.trim()}>
-              {asking ? 'Thinking…' : 'Ask'}
-            </button>
-          </div>
-        )}
-
-        {answer && (
-          <div className="answer">
-            <span className="eyebrow">ANSWER</span>
-            <p>{answer}</p>
-          </div>
-        )}
-      </aside>
-
-      <main className="canvas">
-        {graph.nodes.length > 0 ? (
-          <GraphView
-            rawNodes={graph.nodes}
-            rawEdges={graph.edges}
-            highlightedIds={highlighted}
-            onNodeClick={setSelected}
-          />
-        ) : (
-          <div className="canvas-empty">
-            <p>Paste a small Python repo URL and hit "Analyze repo" to see its architecture.</p>
-          </div>
-        )}
-      </main>
-
-      <aside className="detail">
-        <CodePanel repoId={repoId} selected={selected} onTrace={trace} />
-      </aside>
+    <div className="code-archaeologist-root">
+      {currentRoute === '/workspace' && repoData ? (
+        <WorkspaceView
+          repoData={repoData}
+          onBackToDashboard={() => navigateTo('/')}
+          onTrace={handleTrace}
+          highlightedIds={highlightedIds}
+          onSetHighlightedIds={setHighlightedIds}
+        />
+      ) : (
+        <DashboardView
+          onAnalyze={handleAnalyze}
+          onOpenCached={handleOpenCached}
+          loading={loading}
+          error={error}
+        />
+      )}
     </div>
   )
 }
