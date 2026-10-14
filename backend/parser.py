@@ -6,7 +6,14 @@ from typing import Dict, List, Any, Optional
 
 IGNORE_DIRS = {
     ".git", "node_modules", "venv", ".venv", "__pycache__",
-    "dist", "build", "env", ".pytest_cache", ".ruff_cache", ".mypy_cache"
+    "dist", "build", "env", ".pytest_cache", ".ruff_cache", ".mypy_cache",
+    ".tox", ".nox", "site-packages", "docs_src", "docs", "documentation",
+    "tests", "test", "testing", "fixtures", "examples", "benchmarks", "benchmark"
+}
+
+MINIMAL_IGNORE_DIRS = {
+    ".git", "node_modules", "venv", ".venv", "__pycache__",
+    "dist", "build", "env", ".pytest_cache"
 }
 
 ROUTE_MARKERS = (
@@ -19,10 +26,19 @@ ROUTE_MARKERS = (
 def list_source_files(repo_path: str, extensions=(".py",)) -> List[str]:
     files = []
     for root, dirs, filenames in os.walk(repo_path):
-        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        dirs[:] = [d for d in dirs if d.lower() not in IGNORE_DIRS and not d.startswith(".")]
         for fname in filenames:
             if Path(fname).suffix in extensions:
                 files.append(os.path.join(root, fname))
+    
+    # If filtering removed all files (e.g. a repo whose only python code is in examples or tests), fallback
+    if not files:
+        for root, dirs, filenames in os.walk(repo_path):
+            dirs[:] = [d for d in dirs if d.lower() not in MINIMAL_IGNORE_DIRS]
+            for fname in filenames:
+                if Path(fname).suffix in extensions:
+                    files.append(os.path.join(root, fname))
+
     return sorted(files)
 
 

@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 import git
+import json
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -123,8 +125,8 @@ def generate_architectural_context(extracted: Dict[str, Any], file_change_freq: 
 
 
 @app.post("/api/analyze")
-def analyze(req: AnalyzeRequest):
-    raw_url = req.repo_url.strip()
+def process_repo_analysis(raw_url: str, requested_branch: Optional[str] = None, progress_cb=None) -> Dict[str, Any]:
+    raw_url = raw_url.strip()
     if not raw_url:
         raise HTTPException(status_code=400, detail="Repository URL is required.")
 
@@ -140,16 +142,39 @@ def analyze(req: AnalyzeRequest):
     workdir = Path(tempfile.gettempdir()) / "code-archaeologist" / repo_id
     workdir.mkdir(parents=True, exist_ok=True)
 
-    clone_kwargs: Dict[str, Any] = {"depth": 100}
-    if req.branch:
-        clone_kwargs["branch"] = req.branch
+    if progress_cb:
+        progress_cb(1, "cloning", f"Cloning {repo_name} from GitHub (depth=100)...", 15)
 
-    try:
-        git_repo = git.Repo.clone_from(raw_url, workdir, **clone_kwargs)
-        active_branch = req.branch or (git_repo.active_branch.name if not git_repo.head.is_detached else "main")
-    except Exception as e:
-        shutil.rmtree(workdir, ignore_errors=True)
-        raise HTTPException(status_code=400, detail=f"Could not clone repository: {str(e)}")
+    clean_branch = requested_branch.strip() if requested_branch and requested_branch.strip() else None
+    git_repo = None
+    active_branch = "main"
+
+    # Attempt 1: If branch is specified, try cloning that branch
+    if clean_branch:
+        try:
+            git_repo = git.Repo.clone_from(raw_url, workdir, branch=clean_branch, depth=100)
+            active_branch = clean_branch
+        except Exception as e:
+            # If specified branch failed (e.g. 'main' requested on a 'master' default repo), retry with default branch
+            shutil.rmtree(workdir, ignore_errors=True)
+            workdir.mkdir(parents=True, exist_ok=True)
+            try:
+                git_repo = git.Repo.clone_from(raw_url, workdir, depth=100)
+                active_branch = git_repo.active_branch.name if not git_repo.head.is_detached else "master"
+            except Exception as e2:
+                shutil.rmtree(workdir, ignore_errors=True)
+                raise HTTPException(status_code=400, detail=f"Could not clone repository: {str(e2)}")
+    else:
+        # No branch requested: clone default remote HEAD
+        try:
+            git_repo = git.Repo.clone_from(raw_url, workdir, depth=100)
+            active_branch = git_repo.active_branch.name if not git_repo.head.is_detached else "master"
+        except Exception as e:
+            shutil.rmtree(workdir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail=f"Could not clone repository: {str(e)}")
+
+    if progress_cb:
+        progress_cb(2, "scanning", f"Scanned repository tree ({active_branch} branch). Inspecting Python modules...", 35)
 
     extracted = extract_repo(str(workdir), extensions=(".py",))
     if not extracted["functions"] and not extracted["classes"]:
@@ -159,7 +184,22 @@ def analyze(req: AnalyzeRequest):
             detail="No Python classes or functions found. Only Python repositories are currently supported.",
         )
 
+    num_files = len(extracted["files"])
+    num_fns = len(extracted["functions"])
+    num_classes = len(extracted["classes"])
+
+    if progress_cb:
+        progress_cb(
+            3,
+            "parsing_ast",
+            f"Parsed AST syntax trees across {num_files} core files ({num_fns} functions, {num_classes} classes)...",
+            60,
+        )
+
     G, unresolved = build_graph(extracted)
+
+    if progress_cb:
+        progress_cb(4, "graph", f"Constructed call graph ({G.number_of_nodes()} nodes, {G.number_of_edges()} edges)...", 75)
 
     # Calculate change frequencies
     file_change_freq = get_repo_change_frequency(str(workdir))
@@ -183,8 +223,14 @@ def analyze(req: AnalyzeRequest):
         if fn.get("legacy_id"):
             symbols_by_id[fn["legacy_id"]] = fn
 
+    if progress_cb:
+        progress_cb(5, "git", f"Mining Git commit history and calculating churn hotspots...", 88)
+
     # Retrieve commit log
     commits = get_repo_commits(str(workdir), repo_url=raw_url, limit=50)
+
+    if progress_cb:
+        progress_cb(6, "indexing", "Synthesizing architectural context summary and retrieval index...", 95)
 
     # Generate architectural context summary markdown
     arch_context = generate_architectural_context(extracted, file_change_freq, repo_name)
@@ -210,7 +256,7 @@ def analyze(req: AnalyzeRequest):
 
     graph_data = graph_to_json(G)
 
-    return {
+    result = {
         "repo_id": repo_id,
         "repo_url": raw_url,
         "repo_name": repo_name,
@@ -223,6 +269,64 @@ def analyze(req: AnalyzeRequest):
         "commits": commits,
         "architectural_context": arch_context,
     }
+
+    if progress_cb:
+        progress_cb(7, "complete", "Archeology complete! Loading interactive graph...", 100)
+
+    return result
+
+
+@app.post("/api/analyze")
+def analyze(req: AnalyzeRequest):
+    return process_repo_analysis(req.repo_url, req.branch)
+
+
+@app.post("/api/analyze/stream")
+def analyze_stream(req: AnalyzeRequest):
+    def event_stream():
+        import queue
+        q = queue.Queue()
+
+        def cb(step, stage, message, percent):
+            q.put({
+                "type": "progress",
+                "step": step,
+                "stage": stage,
+                "message": message,
+                "percent": percent,
+            })
+
+        import threading
+
+        result_holder = {}
+        error_holder = {}
+
+        def worker():
+            try:
+                res = process_repo_analysis(req.repo_url, req.branch, progress_cb=cb)
+                result_holder["res"] = res
+            except Exception as ex:
+                error_holder["err"] = ex
+            finally:
+                q.put(None)
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            yield json.dumps(item) + "\n"
+
+        if "err" in error_holder:
+            err = error_holder["err"]
+            detail = err.detail if isinstance(err, HTTPException) else str(err)
+            yield json.dumps({"type": "error", "detail": detail}) + "\n"
+        elif "res" in result_holder:
+            yield json.dumps({"type": "complete", "result": result_holder["res"]}) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
 
 def _get_repo(repo_id: str):
@@ -411,7 +515,7 @@ def ask(repo_id: str, req: AskRequest):
 
     try:
         answer, highlighted_ids = retrieve_and_answer(req.question, data)
-    except RuntimeError as e:
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     return {"answer": answer, "highlighted_ids": highlighted_ids}

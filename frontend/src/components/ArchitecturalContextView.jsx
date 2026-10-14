@@ -1,4 +1,5 @@
 import React, { useState } from 'react'
+import ReactMarkdown from 'react-markdown'
 import {
   FileText,
   Copy,
@@ -44,7 +45,15 @@ export default function ArchitecturalContextView({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question }),
       })
-      const data = await res.json()
+
+      let data = {}
+      const responseText = await res.text()
+      try {
+        data = JSON.parse(responseText)
+      } catch (jsonErr) {
+        throw new Error(responseText || `Request failed with HTTP ${res.status}`)
+      }
+
       if (!res.ok) throw new Error(data.detail || 'Failed to get answer from Gemini')
 
       setAnswer(data.answer)
@@ -136,8 +145,8 @@ export default function ArchitecturalContextView({
                 <Sparkles size={14} className="ai-star-icon" />
                 <span>EXPLANATION</span>
               </div>
-              <div className="qa-answer-body">
-                <p>{answer}</p>
+              <div className="qa-answer-body markdown-content">
+                <ReactMarkdown>{answer}</ReactMarkdown>
               </div>
 
               {highlightedSymbols.length > 0 && (

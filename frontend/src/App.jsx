@@ -10,6 +10,14 @@ export default function App() {
   const [highlightedIds, setHighlightedIds] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [progress, setProgress] = useState({
+    active: false,
+    step: 0,
+    stage: '',
+    message: '',
+    percent: 0,
+    logs: [],
+  })
 
   // Sync route changes with browser history
   useEffect(() => {
@@ -46,44 +54,100 @@ export default function App() {
     }
   }
 
-  // Analyze repo action
-  const handleAnalyze = async (repoUrl, branch = 'main') => {
+  // Analyze repo action with real-time SSE progress
+  const handleAnalyze = async (repoUrl, branch = '') => {
     setLoading(true)
     setError('')
     setHighlightedIds([])
+    setProgress({
+      active: true,
+      step: 1,
+      stage: 'cloning',
+      message: 'Connecting to GitHub repository...',
+      percent: 10,
+      logs: ['Initiating archaeological analysis probe...'],
+    })
 
     try {
-      const res = await fetch('/api/analyze', {
+      const res = await fetch('/api/analyze/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repo_url: repoUrl, branch }),
+        body: JSON.stringify({ repo_url: repoUrl, branch: branch || null }),
       })
 
-      const data = await res.json()
       if (!res.ok) {
-        throw new Error(data.detail || 'Analysis failed. Please verify the repo URL and branch.')
+        let errDetail = 'Analysis request failed.'
+        try {
+          const errData = await res.json()
+          errDetail = errData.detail || errDetail
+        } catch {
+          // ignore
+        }
+        throw new Error(errDetail)
       }
 
-      setRepoData(data)
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let finalData = null
 
-      // Store in localStorage
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop()
+
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try {
+            const msg = JSON.parse(line.trim())
+            if (msg.type === 'progress') {
+              setProgress((prev) => ({
+                active: true,
+                step: msg.step,
+                stage: msg.stage,
+                message: msg.message,
+                percent: msg.percent,
+                logs: [...prev.logs.slice(-12), msg.message],
+              }))
+            } else if (msg.type === 'complete') {
+              finalData = msg.result
+            } else if (msg.type === 'error') {
+              throw new Error(msg.detail || 'Analysis pipeline error')
+            }
+          } catch (pe) {
+            if (pe.message && !pe.message.includes('JSON')) {
+              throw pe
+            }
+          }
+        }
+      }
+
+      if (!finalData) {
+        throw new Error('Analysis completed without receiving repository data.')
+      }
+
+      setRepoData(finalData)
+
+      // Store in localStorage safely
       try {
-        localStorage.setItem('code_archaeologist_active_repo', JSON.stringify(data))
+        localStorage.setItem('code_archaeologist_active_repo', JSON.stringify(finalData))
 
         // Update recents list
         const recentsRaw = localStorage.getItem('code_archaeologist_recents')
         const recents = recentsRaw ? JSON.parse(recentsRaw) : []
         const newEntry = {
-          repo_id: data.repo_id,
-          repo_name: data.repo_name,
-          repo_url: data.repo_url,
-          branch: data.branch,
-          num_files: data.num_files,
-          num_functions: data.num_functions,
+          repo_id: finalData.repo_id,
+          repo_name: finalData.repo_name,
+          repo_url: finalData.repo_url,
+          branch: finalData.branch,
+          num_files: finalData.num_files,
+          num_functions: finalData.num_functions,
           timestamp: new Date().toISOString(),
-          cachedData: data,
+          cachedData: finalData,
         }
-        const filtered = recents.filter((r) => r.repo_name !== data.repo_name)
+        const filtered = recents.filter((r) => r.repo_name !== finalData.repo_name)
         const updatedRecents = [newEntry, ...filtered].slice(0, 8)
         localStorage.setItem('code_archaeologist_recents', JSON.stringify(updatedRecents))
       } catch (e) {
@@ -96,6 +160,7 @@ export default function App() {
       setError(err.message)
     } finally {
       setLoading(false)
+      setProgress((prev) => ({ ...prev, active: false }))
     }
   }
 
@@ -140,6 +205,7 @@ export default function App() {
           onAnalyze={handleAnalyze}
           onOpenCached={handleOpenCached}
           loading={loading}
+          progress={progress}
           error={error}
         />
       )}

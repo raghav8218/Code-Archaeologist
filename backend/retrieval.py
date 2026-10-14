@@ -122,6 +122,10 @@ def _lexical_prefilter(question, repo_index, max_candidates=10):
             haystack += " " + " ".join(fn["decorators"]).lower()
         s = sum(1 for w in q_words if w in haystack)
         if s > 0:
+            if any(w in fn['name'].lower() for w in q_words):
+                s += 2
+            if fn.get("is_route"):
+                s += 1
             scored_functions.append((s, fn["id"]))
     scored_functions.sort(reverse=True)
 
@@ -146,8 +150,12 @@ def _lexical_prefilter(question, repo_index, max_candidates=10):
         haystack = f"{cls['qualified_name']} {cls['file']}".lower()
         s = sum(1 for w in q_words if w in haystack)
         if s > 0:
+            if any(w in cls['name'].lower() for w in q_words):
+                s += 2
             scored_classes.append((s, cls["qualified_name"]))
     scored_classes.sort(reverse=True)
+
+    top_score = scored_functions[0][0] if scored_functions else 0
 
     return {
         "files": [f for _, f in scored_files[:max_candidates]],
@@ -155,56 +163,68 @@ def _lexical_prefilter(question, repo_index, max_candidates=10):
         "classes": [c for _, c in scored_classes[:max_candidates]],
         "constants": [c for _, c in scored_constants[:max_candidates]],
         "imports": [],
+        "top_score": top_score,
     }
 
 
 def _format_index_for_llm(repo_index, lexical_hints=None):
     """
-    Format the repository structural index as a readable text block for
-    the Stage 1 retrieval prompt.  No source code is included.
+    Format the repository structural index as a compact, readable text block for
+    the Stage 1 retrieval prompt.
     """
     lines = []
 
     lines.append("FILES:")
-    for f in repo_index["files"]:
+    for f in repo_index["files"][:50]:
         lines.append(f"  {f['path']}")
+    if len(repo_index["files"]) > 50:
+        lines.append(f"  ... and {len(repo_index['files']) - 50} more files")
 
     if repo_index["classes"]:
         lines.append("\nCLASSES:")
-        for cls in repo_index["classes"]:
+        for cls in repo_index["classes"][:60]:
             lines.append(f"  {cls['qualified_name']} [{cls['file']}]")
+        if len(repo_index["classes"]) > 60:
+            lines.append(f"  ... and {len(repo_index['classes']) - 60} more classes")
 
-    lines.append("\nFUNCTIONS:")
-    for fn in repo_index["functions"]:
+    # Priority sorting for functions: routes and lexical matches first
+    hinted_fn_ids = set((lexical_hints or {}).get("functions", []))
+    sorted_fns = sorted(
+        repo_index["functions"],
+        key=lambda fn: (0 if fn.get("is_route") else (1 if fn["id"] in hinted_fn_ids else 2))
+    )
+
+    lines.append("\nFUNCTIONS (Routes & Candidates First):")
+    for fn in sorted_fns[:80]:
         tag = " [ROUTE]" if fn.get("is_route") else ""
         decs = ""
         if fn.get("decorators"):
-            decs = "  decorators: " + ", ".join(fn["decorators"][:2])
+            decs = " @" + fn["decorators"][0].lstrip("@")
+        params = fn.get("params", "()")
+        if len(params) > 40:
+            params = params[:37] + "...)"
         lines.append(
-            f"  {fn['qualified_name']}{fn.get('params', '()')}"
+            f"  {fn['qualified_name']}{params}"
             f" [{fn['file']}:{fn['start_line']}]{tag}{decs}"
         )
+    if len(sorted_fns) > 80:
+        lines.append(f"  ... and {len(sorted_fns) - 80} more functions")
+
+    if repo_index.get("routes"):
+        lines.append("\nROUTES:")
+        for r in repo_index["routes"][:30]:
+            lines.append(f"  {r['decorator']} -> {r['function_name']} [{r['file']}]")
 
     if repo_index["constants"]:
         lines.append("\nCONSTANTS:")
-        for c in repo_index["constants"]:
+        for c in repo_index["constants"][:15]:
             lines.append(f"  {c['name']} [{c['file']}:{c['line']}]")
 
     if repo_index["imports"]:
-        lines.append("\nIMPORTS:")
-        by_file = {}
-        for imp in repo_index["imports"]:
-            by_file.setdefault(imp.get("file", "?"), []).append(imp["text"])
-        for file_path, texts in sorted(by_file.items()):
-            for t in texts[:8]:  # cap per file to avoid overwhelming the prompt
-                lines.append(f"  {t} [{file_path}]")
-            if len(texts) > 8:
-                lines.append(f"  ... and {len(texts) - 8} more [{file_path}]")
-
-    if repo_index["routes"]:
-        lines.append("\nROUTES:")
-        for r in repo_index["routes"]:
-            lines.append(f"  {r['decorator']} -> {r['function_name']} [{r['file']}]")
+        lines.append("\nKEY IMPORTS:")
+        unique_imports = list(dict.fromkeys(imp["text"] for imp in repo_index["imports"]))
+        for t in unique_imports[:20]:
+            lines.append(f"  {t}")
 
     # If lexical pre-filtering found candidates, surface them as hints.
     if lexical_hints and any(lexical_hints.get(k) for k in lexical_hints):
@@ -215,8 +235,6 @@ def _format_index_for_llm(repo_index, lexical_hints=None):
             lines.append(f"  Files: {', '.join(lexical_hints['files'][:5])}")
         if lexical_hints.get("classes"):
             lines.append(f"  Classes: {', '.join(lexical_hints['classes'][:5])}")
-        if lexical_hints.get("constants"):
-            lines.append(f"  Constants: {', '.join(lexical_hints['constants'][:5])}")
 
     return "\n".join(lines)
 
@@ -325,12 +343,13 @@ def _merge_selections(base, fallback):
 
 # ── Stage 2: Resolve actual source code ──────────────────────────────────
 
-def _resolve_source(selected, functions_by_id, repo_data):
+def _resolve_source(selected, functions_by_id, repo_data, max_methods_per_class=3, max_fns_per_file=3):
     """
     Stage 2: Retrieve actual source code for the selected components.
 
     Uses the already-parsed data stored during /api/analyze — does NOT
     re-read files from disk or ask the LLM to reproduce code.
+    Caps class methods and file functions to prevent context explosion.
     """
     context = {
         "functions": OrderedDict(),   # id -> {source, metadata, ...}
@@ -344,24 +363,31 @@ def _resolve_source(selected, functions_by_id, repo_data):
         if fn and fid not in context["functions"]:
             context["functions"][fid] = _fn_to_context(fn, fid)
 
-    # ── If classes were selected, include their methods ──
+    # ── If classes were selected, include top methods (capped) ──
     for cls_name in selected.get("classes", []):
+        count = 0
         for fid, fn in functions_by_id.items():
             if fn.get("class") == cls_name and fid not in context["functions"]:
                 context["functions"][fid] = _fn_to_context(fn, fid)
+                count += 1
+                if count >= max_methods_per_class:
+                    break
 
-    # ── If files were selected but no functions from them, pull all
-    #    functions in those files so the LLM has some code to work with ──
+    # ── If files were selected but no functions from them, pull capped functions ──
     files_with_functions = {ctx["file"] for ctx in context["functions"].values()}
     for file_path in selected.get("files", []):
         if file_path not in files_with_functions:
+            count = 0
             for fid, fn in functions_by_id.items():
                 if fn["file"] == file_path and fid not in context["functions"]:
                     context["functions"][fid] = _fn_to_context(fn, fid)
+                    count += 1
+                    if count >= max_fns_per_file:
+                        break
 
-    # ── Resolve constants ──
+    # ── Resolve constants (limit to 2) ──
     repo_index = repo_data.get("repo_index", {})
-    for const_name in selected.get("constants", []):
+    for const_name in selected.get("constants", [])[:2]:
         for c in repo_index.get("constants", []):
             if c["name"] == const_name:
                 context["constants"].append(c)
@@ -390,16 +416,14 @@ def _fn_to_context(fn, fid, expanded=False):
 # ── Stage 2.5: Graph-aware context expansion ─────────────────────────────
 
 def _expand_via_graph(context, graph, functions_by_id,
-                      max_callee_hops=2, max_caller_hops=1, max_expanded=12):
+                      max_callee_hops=1, max_caller_hops=1, max_expanded=4):
     """
     Stage 2.5: Expand selected functions through the existing NetworkX
     call graph.
 
-    - Forward (callees): up to max_callee_hops hops so call chains like
-      authenticate() → validate_token() → decode_token() are included
-      even if only the root was explicitly selected.
-    - Backward (callers): one hop to capture immediate callers.
-    - Capped at max_expanded additions to avoid pulling the whole graph.
+    - Forward (callees): 1 hop for immediate call dependencies.
+    - Backward (callers): 1 hop for immediate callers.
+    - Capped at max_expanded additions (default 4) to maintain high performance.
     """
     seed_ids = set(context["functions"].keys())
     expanded_ids = set()
@@ -452,14 +476,25 @@ def _expand_via_graph(context, graph, functions_by_id,
 
 # ── Git context attachment ───────────────────────────────────────────────
 
-def _attach_git_history(context, workdir, limit=5):
+def _attach_git_history(context, workdir, limit=2, question=""):
     """
-    Attach git-blame history to each function in the context.
+    Attach git-blame history to functions in context.
+    Only queries git if question asks for historical context,
+    or limits to top 1-2 functions to eliminate subprocess delay.
+    """
+    q_lower = (question or "").lower()
+    is_history_question = any(
+        w in q_lower for w in ("why", "history", "blame", "commit", "author", "who", "when", "change", "origin", "regression")
+    )
 
-    Only retrieves history for the selected/expanded functions —
-    NOT the entire repository.
-    """
+    # If not a history-focused question, limit to at most 1 primary function to keep response times sub-2s
+    target_count = 2 if is_history_question else 1
+
+    count = 0
     for fn_ctx in context["functions"].values():
+        if count >= target_count:
+            fn_ctx["history"] = []
+            continue
         try:
             history = get_function_history(
                 workdir,
@@ -469,6 +504,7 @@ def _attach_git_history(context, workdir, limit=5):
                 limit=limit,
             )
             fn_ctx["history"] = history
+            count += 1
         except Exception:
             fn_ctx["history"] = []
 

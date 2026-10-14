@@ -25,10 +25,11 @@ export default function DashboardView({
   onAnalyze,
   onOpenCached,
   loading = false,
+  progress = {},
   error = '',
 }) {
   const [repoInput, setRepoInput] = useState('')
-  const [branchInput, setBranchInput] = useState('main')
+  const [branchInput, setBranchInput] = useState('')
   const [recents, setRecents] = useState([])
   const [validationError, setValidationError] = useState('')
 
@@ -64,12 +65,12 @@ export default function DashboardView({
   const handleSubmit = (e) => {
     e?.preventDefault()
     if (!validateRepo(repoInput)) return
-    onAnalyze(repoInput.trim(), branchInput.trim() || 'main')
+    onAnalyze(repoInput.trim(), branchInput.trim())
   }
 
   const handleSelectExample = (ex) => {
     setRepoInput(ex.name)
-    setBranchInput(ex.branch)
+    setBranchInput(ex.branch || '')
     setValidationError('')
   }
 
@@ -128,7 +129,7 @@ export default function DashboardView({
               <GitBranch size={15} className="branch-prefix-icon" />
               <input
                 type="text"
-                placeholder="branch (main)"
+                placeholder="branch (optional)"
                 value={branchInput}
                 onChange={(e) => setBranchInput(e.target.value)}
                 disabled={loading}
@@ -156,9 +157,78 @@ export default function DashboardView({
           </div>
 
           {(validationError || error) && (
-            <div className="dashboard-error-banner">
+            <div className="dashboard-error-banner" role="alert">
               <AlertCircle size={15} />
               <span>{validationError || error}</span>
+            </div>
+          )}
+
+          {/* Live Excavation Progress HUD */}
+          {loading && (
+            <div className="excavation-hud" role="status" aria-live="polite">
+              <div className="excavation-hud-header">
+                <div className="excavation-hud-title-group">
+                  <span className="excavation-pulse-dot" />
+                  <span className="excavation-hud-title">
+                    {progress?.message || 'Archaeological Excavation in Progress…'}
+                  </span>
+                </div>
+                <span className="excavation-percentage">{progress?.percent || 15}%</span>
+              </div>
+
+              {/* Progress Bar */}
+              <div
+                className="excavation-progress-bar-bg"
+                role="progressbar"
+                aria-valuenow={progress?.percent || 15}
+                aria-valuemin="0"
+                aria-valuemax="100"
+              >
+                <div
+                  className="excavation-progress-bar-fill"
+                  style={{ width: `${progress?.percent || 15}%` }}
+                />
+              </div>
+
+              {/* Step Badges */}
+              <div className="excavation-steps-row">
+                {[
+                  { id: 1, label: 'Clone', icon: GitBranch },
+                  { id: 2, label: 'Scan', icon: Compass },
+                  { id: 3, label: 'AST & Trees', icon: Code2 },
+                  { id: 4, label: 'Call Graph', icon: Sparkles },
+                  { id: 5, label: 'Git Churn', icon: Flame },
+                  { id: 6, label: 'Architectural Index', icon: CheckCircle2 },
+                ].map((st) => {
+                  const isDone = (progress?.step || 1) > st.id
+                  const isCurrent = (progress?.step || 1) === st.id
+                  const Icon = st.icon
+                  return (
+                    <div
+                      key={st.id}
+                      className={`excavation-step-pill ${isDone ? 'done' : ''} ${isCurrent ? 'current' : ''}`}
+                    >
+                      <Icon size={12} />
+                      <span>{st.label}</span>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* Live Terminal Log Stream */}
+              {progress?.logs && progress.logs.length > 0 && (
+                <div className="excavation-logs-console">
+                  <Terminal size={12} className="console-icon" />
+                  <div className="console-text-window">
+                    {progress.logs.map((logMsg, i) => (
+                      <div key={i} className="console-log-line">
+                        <span className="console-prompt">&gt;</span>
+                        <span>{logMsg}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </form>

@@ -110,35 +110,39 @@ export function layoutGraph(rawNodes = [], rawEdges = []) {
       weight: e.weight || 1,
     }))
 
-  // Create d3-force simulation with generous collision radius
+  const count = simulationNodes.length
+  const collideIterations = count > 300 ? 1 : count > 100 ? 2 : 3
+  const ticks = count > 350 ? 60 : count > 150 ? 100 : 180
+
+  // Create d3-force simulation with adaptive collision radius
   const simulation = forceSimulation(simulationNodes)
     .force(
       'link',
       forceLink(simulationLinks)
         .id((d) => d.id)
-        .distance((d) => (d.type === 'contains' ? 65 : 140))
-        .strength((d) => (d.type === 'contains' ? 0.7 : 0.2))
+        .distance((d) => (d.type === 'contains' ? 60 : 120))
+        .strength((d) => (d.type === 'contains' ? 0.6 : 0.2))
     )
-    .force('charge', forceManyBody().strength(-220))
-    // Generous collision prevention padding
+    .force('charge', forceManyBody().strength(count > 300 ? -80 : -180))
+    // Collision prevention padding
     .force(
       'collide',
       forceCollide()
-        .radius((d) => d.radius + 48)
-        .iterations(4)
+        .radius((d) => d.radius + (count > 300 ? 20 : 36))
+        .iterations(collideIterations)
     )
     .force(
       'x',
-      forceX((d) => clusterCenters[d.file]?.x || 0).strength(0.32)
+      forceX((d) => clusterCenters[d.file]?.x || 0).strength(0.35)
     )
     .force(
       'y',
-      forceY((d) => clusterCenters[d.file]?.y || 0).strength(0.32)
+      forceY((d) => clusterCenters[d.file]?.y || 0).strength(0.35)
     )
     .stop()
 
-  // Run simulation synchronously
-  simulation.tick(250)
+  // Run simulation synchronously with dynamic ticks to eliminate UI thread lockup
+  simulation.tick(ticks)
 
   // Compute file clusters (bounding boxes for translucent hulls)
   const fileBounds = {}
