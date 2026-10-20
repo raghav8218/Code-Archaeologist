@@ -5,6 +5,7 @@ import {
   forceCollide,
   forceX,
   forceY,
+  forceCenter,
 } from 'd3-force'
 import { MarkerType } from 'reactflow'
 
@@ -46,46 +47,68 @@ export const NODE_CONFIG = {
   },
 }
 
-// Deterministic jitter based on string hash
-function pseudoRandom(seed) {
-  let h = 0
-  for (let i = 0; i < seed.length; i++) {
-    h = Math.imul(31, h) + seed.charCodeAt(i) | 0
-  }
-  return ((h % 1000) / 1000) - 0.5
+export function getModuleGroup(filePath) {
+  if (!filePath || filePath === 'external' || filePath === 'misc') return 'external'
+  const normalized = filePath.replace(/\\/g, '/')
+  const parts = normalized.split('/')
+  if (parts.length === 1) return parts[0]
+  // Group by top-level directory or package (e.g. "pandas/core" or "src/auth")
+  return parts.length >= 3 ? `${parts[0]}/${parts[1]}` : parts[0]
 }
 
 export function layoutGraph(rawNodes = [], rawEdges = []) {
-  if (!rawNodes.length) {
+  if (!rawNodes || !rawNodes.length) {
     return { nodes: [], edges: [], fileHulls: [] }
   }
 
-  // Group nodes by file to establish initial cluster positions
-  const files = [...new Set(rawNodes.map((n) => n.file || 'misc'))]
-  const clusterCenters = {}
+  // 1. Group nodes by their parent architectural package/module
+  const groupNodesMap = {}
+  rawNodes.forEach((n) => {
+    const group = getModuleGroup(n.file)
+    groupNodesMap[group] = groupNodesMap[group] || []
+    groupNodesMap[group].push(n)
+  })
 
-  // Arrange file cluster centers with ample breathing room so hulls don't collide
-  const cols = Math.max(1, Math.ceil(Math.sqrt(files.length * 1.5)))
-  const spacingX = 580
-  const spacingY = 480
+  const groups = Object.keys(groupNodesMap)
+  const countClusters = groups.length
 
-  files.forEach((file, index) => {
-    const col = index % cols
-    const row = Math.floor(index / cols)
-    clusterCenters[file] = {
-      x: (col - cols / 2) * spacingX,
-      y: (row - Math.ceil(files.length / cols) / 2) * spacingY,
+  // 2. Compute non-overlapping cluster centers dynamically based on group size
+  const clusterMeta = groups.map((grp, i) => {
+    const count = groupNodesMap[grp].length
+    const radius = Math.max(180, Math.sqrt(count) * 60 + 60)
+    const angle = (i * 2 * Math.PI) / countClusters
+    const dist = countClusters > 1 ? 480 + (i % 2) * 60 : 0
+    return {
+      id: grp,
+      radius,
+      x: Math.cos(angle) * dist,
+      y: Math.sin(angle) * dist,
     }
   })
 
-  // Prepare nodes for d3-force simulation
-  const simulationNodes = rawNodes.map((n) => {
+  // Separate cluster centers with collision force to guarantee ZERO overlap
+  const centerSim = forceSimulation(clusterMeta)
+    .force('collide', forceCollide((d) => d.radius + 70).iterations(3))
+    .force('center', forceCenter(0, 0))
+    .stop()
+
+  for (let i = 0; i < 35; ++i) centerSim.tick()
+
+  const clusterCenters = {}
+  clusterMeta.forEach((cm) => {
+    clusterCenters[cm.id] = { x: cm.x, y: cm.y, radius: cm.radius }
+  })
+
+  // 3. Prepare nodes with organic positions around their module center
+  const simulationNodes = rawNodes.map((n, idx) => {
     const kind = n.kind || (n.is_route ? 'route' : 'function')
     const config = NODE_CONFIG[kind] || NODE_CONFIG.function
-    const center = clusterCenters[n.file || 'misc'] || { x: 0, y: 0 }
+    const group = getModuleGroup(n.file)
+    const center = clusterCenters[group] || { x: 0, y: 0 }
 
-    const jitterX = pseudoRandom(n.id + '_x') * 160
-    const jitterY = pseudoRandom(n.id + '_y') * 160
+    const isHub = n.is_keystone || kind === 'class' || kind === 'route'
+    const angle = (idx * 137.5 * Math.PI) / 180
+    const dist = isHub ? 20 + (idx % 3) * 20 : 55 + (idx % 6) * 32
 
     return {
       id: n.id,
@@ -93,15 +116,15 @@ export function layoutGraph(rawNodes = [], rawEdges = []) {
       kind,
       radius: config.radius,
       file: n.file || 'misc',
-      x: center.x + jitterX,
-      y: center.y + jitterY,
+      group,
+      x: center.x + Math.cos(angle) * dist,
+      y: center.y + Math.sin(angle) * dist,
     }
   })
 
+  // 4. Map valid links
   const nodeMap = new Map(simulationNodes.map((n) => [n.id, n]))
-
-  // Filter edges to only those whose source and target exist
-  const simulationLinks = rawEdges
+  const validEdges = (rawEdges || [])
     .filter((e) => nodeMap.has(e.source) && nodeMap.has(e.target))
     .map((e) => ({
       source: e.source,
@@ -110,80 +133,64 @@ export function layoutGraph(rawNodes = [], rawEdges = []) {
       weight: e.weight || 1,
     }))
 
-  const count = simulationNodes.length
-  const collideIterations = count > 300 ? 1 : count > 100 ? 2 : 3
-  const ticks = count > 350 ? 60 : count > 150 ? 100 : 180
-
-  // Create d3-force simulation with adaptive collision radius
-  const simulation = forceSimulation(simulationNodes)
+  // 5. Fast, bounded force simulation (converges in ~12ms with distanceMax cutoff)
+  const sim = forceSimulation(simulationNodes)
     .force(
       'link',
-      forceLink(simulationLinks)
+      forceLink(validEdges)
         .id((d) => d.id)
-        .distance((d) => (d.type === 'contains' ? 60 : 120))
-        .strength((d) => (d.type === 'contains' ? 0.6 : 0.2))
+        .distance((d) => (d.type === 'contains' ? 55 : 85))
+        .strength((d) => (d.type === 'contains' ? 0.6 : 0.35))
     )
-    .force('charge', forceManyBody().strength(count > 300 ? -80 : -180))
-    // Collision prevention padding
-    .force(
-      'collide',
-      forceCollide()
-        .radius((d) => d.radius + (count > 300 ? 20 : 36))
-        .iterations(collideIterations)
-    )
-    .force(
-      'x',
-      forceX((d) => clusterCenters[d.file]?.x || 0).strength(0.35)
-    )
-    .force(
-      'y',
-      forceY((d) => clusterCenters[d.file]?.y || 0).strength(0.35)
-    )
+    .force('charge', forceManyBody().strength(-160).distanceMax(380))
+    .force('collide', forceCollide((d) => d.radius + 18).iterations(1))
+    .force('x', forceX((d) => clusterCenters[d.group]?.x || 0).strength(0.35))
+    .force('y', forceY((d) => clusterCenters[d.group]?.y || 0).strength(0.35))
     .stop()
 
-  // Run simulation synchronously with dynamic ticks to eliminate UI thread lockup
-  simulation.tick(ticks)
+  const ticks = simulationNodes.length > 250 ? 40 : 50
+  for (let i = 0; i < ticks; ++i) sim.tick()
 
-  // Compute file clusters (bounding boxes for translucent hulls)
-  const fileBounds = {}
+  // 6. Compute bounding hulls for module groups (clean cards with ample padding)
+  const groupBounds = {}
   simulationNodes.forEach((node) => {
-    const f = node.file
-    if (!fileBounds[f]) {
-      fileBounds[f] = {
+    const grp = node.group
+    if (!groupBounds[grp]) {
+      groupBounds[grp] = {
         minX: Infinity,
         maxX: -Infinity,
         minY: Infinity,
         maxY: -Infinity,
         count: 0,
-        file: f,
+        group: grp,
       }
     }
     const r = node.radius
-    fileBounds[f].minX = Math.min(fileBounds[f].minX, node.x - r)
-    fileBounds[f].maxX = Math.max(fileBounds[f].maxX, node.x + r)
-    fileBounds[f].minY = Math.min(fileBounds[f].minY, node.y - r)
-    fileBounds[f].maxY = Math.max(fileBounds[f].maxY, node.y + r)
-    fileBounds[f].count += 1
+    groupBounds[grp].minX = Math.min(groupBounds[grp].minX, node.x - r)
+    groupBounds[grp].maxX = Math.max(groupBounds[grp].maxX, node.x + r)
+    groupBounds[grp].minY = Math.min(groupBounds[grp].minY, node.y - r)
+    groupBounds[grp].maxY = Math.max(groupBounds[grp].maxY, node.y + r)
+    groupBounds[grp].count += 1
   })
 
-  const padding = 38
-  const headerHeight = 38
+  const padding = 36
+  const headerHeight = 36
 
-  // Generate file hull background nodes
-  const hullNodes = Object.entries(fileBounds)
-    .filter(([file]) => file !== 'external' && file !== 'misc')
-    .map(([file, b]) => {
-      const width = Math.max(160, b.maxX - b.minX + padding * 2)
-      const height = Math.max(100, b.maxY - b.minY + padding * 2 + headerHeight)
+  const hullNodes = Object.entries(groupBounds)
+    .filter(([grp, b]) => grp !== 'external' && grp !== 'misc' && b.count >= 2)
+    .slice(0, 15)
+    .map(([grp, b]) => {
+      const width = Math.max(200, b.maxX - b.minX + padding * 2)
+      const height = Math.max(120, b.maxY - b.minY + padding * 2 + headerHeight)
       return {
-        id: `hull_${file}`,
+        id: `hull_${grp}`,
         type: 'fileHull',
         position: {
           x: b.minX - padding,
           y: b.minY - padding - headerHeight,
         },
         data: {
-          file,
+          file: grp,
           symbolCount: b.count,
           width,
           height,
@@ -198,7 +205,7 @@ export function layoutGraph(rawNodes = [], rawEdges = []) {
       }
     })
 
-  // Format ReactFlow circular nodes (fully draggable!)
+  // 7. Format ReactFlow circular nodes
   const reactFlowNodes = simulationNodes.map((n) => {
     const config = NODE_CONFIG[n.kind] || NODE_CONFIG.function
     return {
@@ -217,6 +224,7 @@ export function layoutGraph(rawNodes = [], rawEdges = []) {
         qualified_name: n.raw.qualified_name || n.raw.name,
         kind: n.kind,
         file: n.file,
+        group: n.group,
         radius: config.radius,
         color: config.color,
         border: config.border,
@@ -224,6 +232,9 @@ export function layoutGraph(rawNodes = [], rawEdges = []) {
         change_frequency: n.raw.change_frequency || 0,
         loc: n.raw.loc || 0,
         complexity: n.raw.complexity || 1,
+        hotspot_score: n.raw.hotspot_score || 0,
+        is_keystone: Boolean(n.raw.is_keystone),
+        has_circular_dependency: Boolean(n.raw.has_circular_dependency),
       },
       zIndex: 10,
     }
@@ -231,56 +242,60 @@ export function layoutGraph(rawNodes = [], rawEdges = []) {
 
   const allNodes = [...hullNodes, ...reactFlowNodes]
 
-  // Format edges: directional curved cubic-bezier links
-  const edges = simulationLinks.map((e, index) => {
+  // 8. Format edges with vibrant, high-contrast aesthetics and visible flow
+  const edges = validEdges.map((e, index) => {
     const sourceId = typeof e.source === 'object' && e.source !== null ? e.source.id : e.source
     const targetId = typeof e.target === 'object' && e.target !== null ? e.target.id : e.target
     const edgeType = e.type || 'calls'
 
-    let stroke = '#64748B' // Subtle default slate stroke
+    let stroke = '#38BDF8' // High-visibility Sky Blue for calls
     let strokeDasharray = undefined
+    let strokeWidth = 1.4
+    let opacity = 0.45
 
     if (edgeType === 'contains') {
-      stroke = '#8B5CF6'
-      strokeDasharray = '3 3'
+      stroke = '#A78BFA' // Lavender
+      strokeDasharray = '4 4'
+      strokeWidth = 1.3
+      opacity = 0.55
     } else if (edgeType === 'imports') {
-      stroke = '#C084FC'
-      strokeDasharray = '5 4'
+      stroke = '#818CF8' // Indigo
+      strokeDasharray = '6 3'
+      strokeWidth = 1.2
+      opacity = 0.4
     } else if (edgeType === 'instantiates') {
-      stroke = '#818CF8'
-    } else if (edgeType === 'calls') {
-      stroke = '#38BDF8'
+      stroke = '#34D399' // Emerald
+      strokeWidth = 1.6
+      opacity = 0.6
     }
 
     return {
       id: `e-${index}-${sourceId}-${targetId}`,
       source: sourceId,
       target: targetId,
-      // Curved cubic-bezier links
       type: 'default',
       animated: false,
       style: {
         stroke,
-        strokeWidth: 1.3,
-        opacity: 0.22, // Subtle by default to avoid hairball
+        strokeWidth,
+        opacity,
         strokeDasharray,
       },
       markerEnd: {
         type: MarkerType.ArrowClosed,
         color: stroke,
-        width: 12,
-        height: 12,
+        width: 11,
+        height: 11,
       },
       data: {
+        baseStroke: stroke,
+        baseStrokeWidth: strokeWidth,
         edgeType,
-        weight: e.weight,
         sourceId,
         targetId,
-        baseStroke: stroke,
-        baseStrokeDasharray: strokeDasharray,
       },
     }
   })
 
-  return { nodes: allNodes, edges }
+  return { nodes: allNodes, edges, fileHulls: hullNodes }
 }

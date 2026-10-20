@@ -16,7 +16,7 @@ relationships — but NO source code — so Stage 1 is cheap and fast.
 import re
 from collections import OrderedDict
 
-from llm import select_relevant_components, generate_response
+from llm import select_relevant_components, generate_response, generate_response_stream
 from git_utils import get_function_history
 
 
@@ -409,6 +409,7 @@ def _fn_to_context(fn, fid, expanded=False):
         "class": fn.get("class"),
         "is_route": fn.get("is_route", False),
         "decorators": fn.get("decorators", []),
+        "history": fn.get("history", []),
         "expanded": expanded,
     }
 
@@ -479,15 +480,15 @@ def _expand_via_graph(context, graph, functions_by_id,
 def _attach_git_history(context, workdir, limit=2, question=""):
     """
     Attach git-blame history to functions in context.
-    Only queries git if question asks for historical context,
-    or limits to top 1-2 functions to eliminate subprocess delay.
+    Uses pre-mined SQLite history if workdir has been cleaned up,
+    or queries git directly if workdir is available.
     """
+    import os
     q_lower = (question or "").lower()
     is_history_question = any(
         w in q_lower for w in ("why", "history", "blame", "commit", "author", "who", "when", "change", "origin", "regression")
     )
 
-    # If not a history-focused question, limit to at most 1 primary function to keep response times sub-2s
     target_count = 2 if is_history_question else 1
 
     count = 0
@@ -495,17 +496,26 @@ def _attach_git_history(context, workdir, limit=2, question=""):
         if count >= target_count:
             fn_ctx["history"] = []
             continue
-        try:
-            history = get_function_history(
-                workdir,
-                fn_ctx["file"],
-                fn_ctx["start_line"],
-                fn_ctx["end_line"],
-                limit=limit,
-            )
-            fn_ctx["history"] = history
+
+        # If already cached in symbol metadata (from database), use directly!
+        if fn_ctx.get("history") and len(fn_ctx["history"]) > 0:
             count += 1
-        except Exception:
+            continue
+
+        if workdir and os.path.exists(workdir):
+            try:
+                history = get_function_history(
+                    workdir,
+                    fn_ctx["file"],
+                    fn_ctx["start_line"],
+                    fn_ctx["end_line"],
+                    limit=limit,
+                )
+                fn_ctx["history"] = history
+                count += 1
+            except Exception:
+                fn_ctx["history"] = []
+        else:
             fn_ctx["history"] = []
 
     return context
@@ -699,3 +709,76 @@ def retrieve_and_answer(question, repo_data, max_context_chars=30_000):
         raise  # Let the caller handle missing API key etc.
 
     return answer, highlighted_ids
+
+
+def retrieve_and_answer_stream(question, repo_data, max_context_chars=30_000):
+    """
+    Two-stage retrieval pipeline streaming Gemini tokens in real-time.
+
+    Flow:
+        1. Identifies relevant AST components via structural index
+        2. Resolves source code and call-graph neighborhood
+        3. Attaches surgical Git blame history
+        4. Yields {"type": "metadata", "highlighted_ids": [...]} immediately
+        5. Yields {"type": "token", "delta": "..."} as Gemini generates words
+        6. Yields {"type": "done", "full_answer": "...", "highlighted_ids": [...]}
+    """
+    repo_index = repo_data.get("repo_index") or {"files": [], "classes": [], "functions": [], "constants": [], "imports": [], "routes": []}
+    functions_by_id = repo_data.get("functions_by_id") or {}
+    graph = repo_data.get("graph")
+    workdir = repo_data.get("workdir", "")
+
+    # ── Lexical pre-filter (zero cost, used as hints + fallback) ──
+    lexical_hints = _lexical_prefilter(question, repo_index)
+
+    # ── Stage 1: LLM-based component selection ──
+    try:
+        selected = _llm_select_components(question, repo_index, lexical_hints)
+        selected = _validate_selections(selected, repo_index)
+    except Exception:
+        selected = lexical_hints
+
+    # If Stage 1 returned very few results, broaden with lexical fallback
+    if _count_selections(selected) < 2:
+        selected = _merge_selections(selected, lexical_hints)
+
+    if _count_selections(selected) == 0:
+        if repo_index.get("functions"):
+            selected["functions"] = [fn["id"] for fn in repo_index["functions"][:4]]
+        elif functions_by_id:
+            selected["functions"] = list(functions_by_id.keys())[:4]
+
+    # ── Stage 2: Resolve actual source code ──
+    context = _resolve_source(selected, functions_by_id, repo_data)
+
+    # ── Stage 2.5: Graph-aware expansion ──
+    if graph:
+        context = _expand_via_graph(context, graph, functions_by_id)
+
+    # ── Attach git history to selected functions ──
+    context = _attach_git_history(context, workdir)
+
+    # ── Enforce context size limit ──
+    context = _enforce_context_limit(context, max_context_chars)
+
+    # ── Build final prompt ──
+    final_prompt = _build_final_prompt(question, context)
+
+    # Collect highlighted function IDs for the frontend graph overlay
+    highlighted_ids = list(context["functions"].keys())
+
+    # Step 1: Yield metadata with citations/highlighted_ids first
+    yield {"type": "metadata", "highlighted_ids": highlighted_ids}
+
+    # Step 2: Stream tokens from Gemini as they arrive
+    accumulated = []
+    for chunk in generate_response_stream(final_prompt):
+        accumulated.append(chunk)
+        yield {"type": "token", "delta": chunk}
+
+    # Step 3: Yield completion event with complete answer
+    yield {
+        "type": "done",
+        "full_answer": "".join(accumulated),
+        "highlighted_ids": highlighted_ids,
+    }

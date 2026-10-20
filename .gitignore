@@ -12,3 +12,17 @@ backend/.venv/
 .vscode/
 .idea/
 
+# Documentation & Generated Study Guides
+Code_Archaeologist_Documentation.*
+Developer_Study_Guide.*
+*.pdf
+*.html.pdf
+*.txt
+session_summary*
+
+# Local SQLite Database
+backend/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

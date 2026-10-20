@@ -28,6 +28,7 @@ export default function WorkspaceView({
   const [activeTab, setActiveTab] = useState('graph') // 'graph' | 'git' | 'context'
   const [selectedNode, setSelectedNode] = useState(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [jumpToNodeId, setJumpToNodeId] = useState(null)
 
   const {
     repo_id,
@@ -55,6 +56,18 @@ export default function WorkspaceView({
   const handleSelectSymbol = (symbol) => {
     setSelectedNode(symbol)
     setSidebarOpen(true)
+  }
+
+  const handleJumpToSymbol = (symId) => {
+    setActiveTab('graph')
+    setJumpToNodeId(symId)
+    const target = graph.nodes?.find(
+      (n) => n.id === symId || n.raw_id === symId || n.name === symId
+    )
+    if (target) {
+      setSelectedNode(target)
+      setSidebarOpen(true)
+    }
   }
 
   return (
@@ -154,31 +167,54 @@ export default function WorkspaceView({
       <div className="workspace-main-split">
         {/* Main Tab Content */}
         <main className="workspace-content-canvas">
-          {activeTab === 'graph' && (
+          <div
+            style={{
+              display: activeTab === 'graph' ? 'flex' : 'none',
+              width: '100%',
+              height: '100%',
+              position: 'relative',
+            }}
+          >
             <GraphView
               rawNodes={graph.nodes}
               rawEdges={graph.edges}
               highlightedIds={highlightedIds}
               selectedNode={selectedNode}
               onNodeClick={handleSelectSymbol}
+              jumpToNodeId={jumpToNodeId}
             />
-          )}
+          </div>
 
-          {activeTab === 'git' && (
+          <div
+            style={{
+              display: activeTab === 'git' ? 'flex' : 'none',
+              width: '100%',
+              height: '100%',
+              overflow: 'hidden',
+            }}
+          >
             <GitHistoryView
               commits={commits}
               fileChangeFreq={fileChangeFreq}
               repoUrl={repo_url}
             />
-          )}
+          </div>
 
-          {activeTab === 'context' && (
+          <div
+            style={{
+              display: activeTab === 'context' ? 'flex' : 'none',
+              width: '100%',
+              height: '100%',
+              overflow: 'hidden',
+            }}
+          >
             <ArchitecturalContextView
               repoId={repo_id}
               contextMarkdown={architectural_context}
               onHighlightNodes={onSetHighlightedIds}
+              onJumpToSymbol={handleJumpToSymbol}
             />
-          )}
+          </div>
         </main>
 
         {/* Resizable / Collapsible Right Inspector Sidebar */}

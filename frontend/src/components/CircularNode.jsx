@@ -1,7 +1,10 @@
-import React, { memo } from 'react'
+import React, { memo, useContext } from 'react'
 import { Handle, Position } from 'reactflow'
+import { GraphInteractionContext } from './GraphView'
 
-function CircularNode({ data, selected }) {
+function CircularNode({ id, data, selected }) {
+  const interaction = useContext(GraphInteractionContext)
+
   const {
     label,
     kind,
@@ -10,46 +13,70 @@ function CircularNode({ data, selected }) {
     border,
     icon,
     change_frequency = 0,
-    isHighlighted = false,
-    isHovered = false,
-    isDimmed = false,
-    isCaller = false,
-    isCallee = false,
+    complexity = 1,
+    hotspot_score = 0,
+    is_keystone = false,
+    has_circular_dependency = false,
   } = data
+
+  const hoveredNodeId = interaction?.hoveredNodeId
+  const isHoverActive = Boolean(hoveredNodeId)
+  const isCurrentHover = id === hoveredNodeId
+  const isCaller = isHoverActive && Boolean(interaction?.hoveredCallers?.has(id))
+  const isCallee = isHoverActive && Boolean(interaction?.hoveredCallees?.has(id))
+  const isConnected = isCurrentHover || isCaller || isCallee
+  const isDimmed = isHoverActive && !isConnected
+
+  const isSelected = selected || interaction?.selectedId === id || (data.raw && interaction?.selectedId === data.raw.id)
+
+  const isSearchMatch =
+    interaction?.searchQuery &&
+    interaction.searchQuery.trim().length > 0 &&
+    ((label && label.toLowerCase().includes(interaction.searchQuery.toLowerCase())) ||
+      (data.file && data.file.toLowerCase().includes(interaction.searchQuery.toLowerCase())))
+
+  const isHighlighted =
+    (interaction?.highlightedIds && (interaction.highlightedIds.includes(id) || (data.raw && interaction.highlightedIds.includes(data.raw.id)))) ||
+    isSearchMatch ||
+    isSelected
 
   const diameter = radius * 2
 
-  // Churn hotspot border intensity
-  const hasHotspot = change_frequency > 0
-  const hotspotRing = hasHotspot ? Math.min(6, 2 + Math.log2(change_frequency + 1)) : 0
+  // CodeScene Hotspot Formula: Complexity * log2(Churn + 1)
+  const effectiveHotspotScore = hotspot_score > 0
+    ? hotspot_score
+    : (change_frequency > 0 ? Math.round(complexity * Math.log2(change_frequency + 1)) : 0)
+
+  const isHotspot = effectiveHotspotScore >= 4
+  const hotspotRing = isHotspot ? Math.min(7, 2 + Math.log2(effectiveHotspotScore + 1)) : 0
 
   let currentOpacity = 1.0
   if (isDimmed) {
-    currentOpacity = 0.2
+    currentOpacity = 0.22
   }
 
   let ringColor = 'transparent'
-  if (isHighlighted || selected) {
+  if (isHighlighted || isSelected) {
     ringColor = '#38BDF8'
   } else if (isCaller) {
     ringColor = '#06B6D4' // Electric Cyan for caller
   } else if (isCallee) {
     ringColor = '#F43F5E' // Rose for callee
-  } else if (isHovered) {
+  } else if (isCurrentHover) {
     ringColor = '#F8FAFC'
-  } else if (hasHotspot) {
-    ringColor = 'rgba(239, 68, 68, 0.7)' // Reddish hotspot
+  } else if (isHotspot) {
+    ringColor = 'rgba(239, 68, 68, 0.75)' // CodeScene Hotspot Red
   }
 
   return (
     <div
-      className={`circular-node-wrapper ${isDimmed ? 'is-dimmed' : ''} ${isHovered ? 'is-hovered' : ''}`}
+      className={`circular-node-wrapper ${isDimmed ? 'is-dimmed' : ''} ${isCurrentHover ? 'is-hovered' : ''}`}
       style={{
         opacity: currentOpacity,
         transition: 'opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
       }}
     >
-      {/* Main Circle (with static handles attached to its edges) */}
+      {/* Main Circle */}
       <div
         className="circular-node-circle"
         style={{
@@ -57,7 +84,7 @@ function CircularNode({ data, selected }) {
           height: diameter,
           backgroundColor: color,
           borderColor: border,
-          transform: isHovered || isHighlighted ? 'scale(1.12)' : 'scale(1)',
+          transform: isCurrentHover || isHighlighted ? 'scale(1.14)' : 'scale(1)',
           transition: 'transform 0.18s ease, box-shadow 0.18s ease',
           boxShadow:
             ringColor !== 'transparent'
@@ -65,7 +92,6 @@ function CircularNode({ data, selected }) {
               : `0 0 12px ${color}40`,
         }}
       >
-        {/* Handles attached to the 4 sides of the circle */}
         <Handle
           type="target"
           position={Position.Top}
@@ -100,27 +126,53 @@ function CircularNode({ data, selected }) {
         </span>
       </div>
 
-      {/* Symbol Label (without native OS title tooltip to prevent mouse-leave flickering) */}
+      {/* Symbol Label & Badges (no native title attributes to prevent browser mouseleave flickering) */}
       <div className="circular-node-label-container">
         <span className={`circular-node-label ${isHighlighted ? 'highlighted' : ''}`}>
           {label}
         </span>
-        {hasHotspot && (
+
+        {/* CodeScene Hotspot Badge */}
+        {isHotspot && (
           <span className="circular-node-churn-badge">
-            ↻{change_frequency}
+            🔥{effectiveHotspotScore}
+          </span>
+        )}
+
+        {/* Keystone Badge (PageRank hub) */}
+        {is_keystone && (
+          <span className="circular-node-keystone-badge">
+            👑
+          </span>
+        )}
+
+        {/* Circular Dependency Warning */}
+        {has_circular_dependency && (
+          <span className="circular-node-cycle-badge">
+            ⟲
           </span>
         )}
       </div>
 
-      {/* Sleek Custom In-Canvas Tooltip (pointer-events: none, so it never flickers) */}
-      {isHovered && (
+      {/* Sleek Custom In-Canvas Tooltip (pointer-events: none, strictly inside canvas) */}
+      {isCurrentHover && (
         <div className="node-hover-tooltip">
-          <div className="tooltip-kind">{kind}</div>
+          <div className="tooltip-kind">{kind} {is_keystone ? '• Keystone Hub' : ''}</div>
           <div className="tooltip-title">{data.qualified_name || label}</div>
           {data.file && <div className="tooltip-file">{data.file}</div>}
-          {hasHotspot && (
+          <div className="tooltip-metrics">
+            <span>LOC: {data.loc || 1}</span>
+            <span>Complexity: {complexity}</span>
+            {change_frequency > 0 && <span>Commits: {change_frequency}</span>}
+          </div>
+          {isHotspot && (
             <div className="tooltip-churn">
-              Changed in {change_frequency} commit{change_frequency === 1 ? '' : 's'}
+              🔥 CodeScene Hotspot Score: {effectiveHotspotScore}
+            </div>
+          )}
+          {has_circular_dependency && (
+            <div className="tooltip-cycle-warning">
+              ⚠️ Part of a circular dependency loop
             </div>
           )}
         </div>
